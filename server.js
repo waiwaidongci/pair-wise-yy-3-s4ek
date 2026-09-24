@@ -3,6 +3,21 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  THICKNESS_MIN_MM,
+  THICKNESS_MAX_MM,
+  PASS_STREAK_TO_RELEASE,
+  ORDER_STATUS,
+  FirstPieceRuleError,
+  registerGrinding,
+  createOrder,
+  submitInspection,
+  submitRegrind,
+  correctSampleInfo,
+  rejudgeOnCorrection,
+} from "./business/firstPieceRules.js";
+import { loadOrders, saveOrders, withOrders } from "./business/firstPieceRecords.js";
+import { firstPieceStyle, firstPiecePanel, firstPieceClient } from "./business/firstPiecePage.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const dbPath = join(__dirname, "data", "core-slices.json");
@@ -72,6 +87,7 @@ const page = `<!doctype html>
     .meta { color:var(--muted); font-size:13px; } .pill { display:inline-block; border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:12px; }
     .slice { border-top:1px solid var(--line); padding-top:10px; } .toolbar { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:14px; }
     @media (max-width:950px){ header{display:block;padding:18px 16px;} main{grid-template-columns:1fr;padding:16px;} .stats{grid-template-columns:1fr 1fr;} }
+    ${firstPieceStyle()}
   </style>
 </head>
 <body>
@@ -93,6 +109,7 @@ const page = `<!doctype html>
       <div class="grid" id="samples"></div>
     </section>
   </main>
+  ${firstPiecePanel()}
   <script>
     const statuses = ${JSON.stringify(statuses)};
     const steps = ${JSON.stringify(taskSteps)};
@@ -117,26 +134,46 @@ const page = `<!doctype html>
       document.querySelectorAll("[data-add]").forEach(btn => btn.onclick = async () => {
         const id = btn.dataset.add;
         await api('/api/samples/'+id+'/slices', { method:'POST', body: JSON.stringify({ id: document.querySelector('[data-new-slice="'+id+'"]').value, method: document.querySelector('[data-method="'+id+'"]').value || "未指定" }) });
-        await load();
+        await reloadAll();
       });
       document.querySelectorAll("[data-log]").forEach(btn => btn.onclick = async () => {
         const [sampleId, sliceId] = btn.dataset.log.split("|");
-        await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
-        await load();
+        try {
+          await api('/api/samples/'+sampleId+'/slices/'+sliceId+'/logs', { method:'POST', body: JSON.stringify({ step: document.querySelector('[data-step="'+sampleId+'|'+sliceId+'"]').value, note: document.querySelector('[data-note="'+sampleId+'|'+sliceId+'"]').value || "步骤完成" }) });
+        } catch (error) { alert(error.message); }
+        await reloadAll();
       });
       document.querySelectorAll("[data-deliver]").forEach(btn => btn.onclick = async () => { await api('/api/samples/'+btn.dataset.deliver+'/deliver', { method:'POST', body: JSON.stringify({}) }); await load(); });
     }
     async function load(){ samples = await api("/api/samples"); render(); }
-    document.querySelector("#reload").onclick = load;
+    async function reloadAll() {
+      await load();
+      if (window.__initFirstPiece) await window.__initFirstPiece();
+    }
+    document.querySelector("#reload").onclick = reloadAll;
     form.onsubmit = async event => {
       event.preventDefault();
       await api("/api/samples", { method:"POST", body: JSON.stringify(Object.fromEntries(new FormData(form).entries())) });
-      form.reset(); await load();
+      form.reset(); await reloadAll();
     };
-    load();
+    reloadAll();
   </script>
+  <script>${firstPieceClient({ THICKNESS_MIN_MM, THICKNESS_MAX_MM, PASS_STREAK_TO_RELEASE, ORDER_STATUS })}</script>
 </body>
 </html>`;
+
+function findSlice(db, sampleId, sliceId) {
+  const sample = db.samples.find(item => item.id === sampleId);
+  if (!sample) return { sample: null, slice: null };
+  return { sample, slice: sample.slices.find(item => item.id === sliceId) || null };
+}
+function appendFirstPieceLog(sample, slice, note) {
+  slice.logs.push({ at: new Date().toISOString(), step: slice.status, note });
+}
+function ruleError(res, error) {
+  if (error instanceof FirstPieceRuleError) return sendJson(res, 409, { error: error.code, message: error.message });
+  throw error;
+}
 
 const server = http.createServer(async (req, res) => {
   try {
@@ -172,6 +209,16 @@ const server = http.createServer(async (req, res) => {
       const slice = sample.slices.find(item => item.id === logMatch[2]);
       if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
       const input = await body(req);
+      if (input.step === "研磨") {
+        try {
+          await withOrders(orders => registerGrinding(orders, { sample, slice }));
+        } catch (error) {
+          if (error instanceof FirstPieceRuleError) {
+            return sendJson(res, 409, { error: error.code, message: error.message });
+          }
+          throw error;
+        }
+      }
       slice.status = input.step;
       if (input.step === "观察") slice.observation = input.note || slice.observation;
       slice.logs.push({ at: new Date().toISOString(), step: input.step, note: input.note || "" });
@@ -187,6 +234,74 @@ const server = http.createServer(async (req, res) => {
       updateSampleStatus(sample);
       await saveDb(db);
       return sendJson(res, 200, sample);
+    }
+    // 开机首件确认 ----------------------------------------------------------
+    if (req.method === "GET" && url.pathname === "/api/first-piece/orders") {
+      return sendJson(res, 200, await loadOrders());
+    }
+    if (req.method === "POST" && url.pathname === "/api/first-piece/orders") {
+      const input = await body(req);
+      try {
+        const { result: order } = await withOrders(orders => createOrder(input, orders));
+        return sendJson(res, 201, order);
+      } catch (error) {
+        return ruleError(res, error);
+      }
+    }
+    const fpOrderMatch = url.pathname.match(/^\/api\/first-piece\/orders\/([^/]+)\/(inspections|regrinds)$/);
+    if (fpOrderMatch && req.method === "POST") {
+      const input = await body(req);
+      const { sample, slice } = findSlice(db, input.sampleId, input.sliceId);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      if (!slice) return sendJson(res, 404, { error: "slice_not_found" });
+      try {
+        const { result: order } = await withOrders(async orders => {
+          const order = orders.find(item => item.id === fpOrderMatch[1]);
+          if (!order) return { error: "order_not_found" };
+          if (fpOrderMatch[2] === "inspections") {
+            submitInspection(order, input, { sample, slice });
+            appendFirstPieceLog(sample, slice,
+              `首件确认 ${order.id}：厚度 ${input.thickness}mm${input.scratches ? "，划痕" : ""}${input.edgeBurn ? "，边缘烧灼" : ""}，检验人 ${input.inspector}`);
+          } else {
+            submitRegrind(order, input, { sample, slice });
+            appendFirstPieceLog(sample, slice,
+              `首件复磨 ${order.id}：复磨人 ${input.operator}，厚度 ${input.thickness}mm${input.scratches ? "，划痕" : ""}${input.edgeBurn ? "，边缘烧灼" : ""}，检验人 ${input.inspector}`);
+          }
+          updateSampleStatus(sample);
+          return order;
+        });
+        if (order?.error === "order_not_found") return sendJson(res, 404, { error: "order_not_found" });
+        await saveDb(db);
+        return sendJson(res, 200, order);
+      } catch (error) {
+        return ruleError(res, error);
+      }
+    }
+    // 样本钻孔/岩芯箱/染色方法更正：原确认作废并按新值重判
+    const correctMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/correction$/);
+    if (correctMatch && req.method === "PATCH") {
+      const sample = db.samples.find(item => item.id === correctMatch[1]);
+      if (!sample) return sendJson(res, 404, { error: "sample_not_found" });
+      const input = await body(req);
+      try {
+        const { sample: corrected, changed } = correctSampleInfo(sample, input);
+        const reopened = (await withOrders(orders => rejudgeOnCorrection(orders, corrected, changed))).result;
+        const idx = db.samples.findIndex(item => item.id === sample.id);
+        db.samples[idx] = corrected;
+        const notes = changed.map(c =>
+          c.field === "method"
+            ? `染色方法更正（${c.sliceId}）：${c.from} → ${c.to}，原首件确认作废并按新值重判`
+            : `样本信息更正：${c.field === "borehole" ? "钻孔" : "岩芯箱"} ${c.from} → ${c.to}，原首件确认作废并按新值重判`
+        );
+        if (notes.length) {
+          corrected.slices.forEach(s => s.logs.push({ at: new Date().toISOString(), step: s.status, note: notes.join("；") }));
+        }
+        updateSampleStatus(corrected);
+        await saveDb(db);
+        return sendJson(res, 200, { sample: corrected, changed, reopened });
+      } catch (error) {
+        return ruleError(res, error);
+      }
     }
     sendJson(res, 404, { error: "not_found" });
   } catch (error) {
